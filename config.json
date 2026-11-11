@@ -1,5 +1,9 @@
 {
   "include_repositories": [],
-  "exclude_repositories": [],
-  "branch_overrides": {}
+  "exclude_repositories": [
+    "Lanyifan/claude-code"
+  ],
+  "branch_overrides": {
+    "Lanyifan/poly-sdk": ["main"]
+  }
 }
