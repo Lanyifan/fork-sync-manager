@@ -1,0 +1,55 @@
+name: Sync forks
+
+on:
+  schedule:
+    # UTC 01:17，即北京时间每天 09:17。
+    - cron: '17 1 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只检查更新，不创建备份 tag，也不修改分支'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout manager repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check and sync forks
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || (github.event_name != 'workflow_dispatch' && vars.FORK_SYNC_ENABLED != 'true') }}
+        run: python3 scripts/sync_forks.py
+
+      - name: Write run summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f report.md ]; then
+            cat report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: fork-sync-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            report.md
+            report.json
+          if-no-files-found: warn
+          retention-days: 30
