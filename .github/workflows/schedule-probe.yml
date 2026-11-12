@@ -1,0 +1,24 @@
+name: Schedule probe
+
+on:
+  schedule:
+    - cron: '3-58/5 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Show event and UTC time
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CRON: ${{ github.event.schedule }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          echo "event=$EVENT_NAME"
+          echo "cron=$CRON"
+          echo "sha=$COMMIT_SHA"
+          date -u
