@@ -3,7 +3,7 @@ name: Sync forks
 on:
   schedule:
     # UTC 01:17，即北京时间每天 09:17。
-    - cron: '17 1 * * *'
+    - cron: '*/10 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
