@@ -17,13 +17,22 @@ LABELS = {
     "up_to_date": "已是最新",
     "would_sync": "可以同步（只检查）",
     "synced": "同步成功",
+    "would_create": "可以创建分支（只检查）",
+    "created": "新分支已创建",
     "local_ahead": "fork 有额外提交，跳过",
     "diverged": "双方历史分叉，跳过",
     "excluded": "配置排除",
     "archived": "归档仓库，跳过",
+    "no_branches": "上游无分支，跳过",
     "changed_during_check": "检查期间分支变化，跳过",
     "error": "失败",
 }
+
+
+class GitHubAPIError(RuntimeError):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
 
 
 class GitHubAPI:
@@ -55,7 +64,7 @@ class GitHubAPI:
             except (ValueError, AttributeError):
                 message = str(exc.reason)
             message = str(message).replace(self.token, "[REDACTED]")
-            raise RuntimeError(
+            raise GitHubAPIError(exc.code,
                 f"GitHub API {exc.code}: {message[:400]}；请求 {method} {path}"
             ) from None
         except (URLError, TimeoutError) as exc:
@@ -65,9 +74,12 @@ class GitHubAPI:
 def validate_config(config):
     if not isinstance(config, dict):
         raise ValueError("config.json 顶层必须是 JSON 对象。")
-    allowed = {"include_repositories", "exclude_repositories", "branch_overrides"}
+    allowed = {"include_repositories", "exclude_repositories", "branch_overrides",
+               "sync_all_branches"}
     if set(config) - allowed:
         raise ValueError("config.json 含未知配置字段，请检查拼写。")
+    if not isinstance(config.get("sync_all_branches", False), bool):
+        raise ValueError("sync_all_branches 必须是 JSON 布尔值 true 或 false。")
     for key in ("include_repositories", "exclude_repositories"):
         values = config.get(key, [])
         if not isinstance(values, list) or any(
@@ -107,9 +119,47 @@ def reference_sha(api, repo, branch):
     return api.request("GET", path)["object"]["sha"]
 
 
-def sync_branch(api, repo, upstream, branch, dry_run, run_label, result):
+def repository_branches(api, repo):
+    page = 1
+    while True:
+        query = urlencode({"per_page": 100, "page": page})
+        branches = api.request("GET", f"/repos/{repo}/branches?{query}")
+        yield from branches
+        if len(branches) < 100:
+            break
+        page += 1
+
+
+def create_branch(api, repo, upstream, branch, dry_run, result):
+    target_sha = reference_sha(api, upstream, branch)
+    result["upstream_sha"] = target_sha
+    if dry_run:
+        result.update(status="would_create", message="fork 中缺少此分支，可从上游原始 SHA 创建。")
+        return
+
+    # 创建引用不会覆盖已有分支；如果有人并发创建，GitHub 会拒绝此次 POST。
+    created = api.request(
+        "POST", f"/repos/{repo}/git/refs",
+        {"ref": "refs/heads/" + branch, "sha": target_sha},
+    )
+    result["after_sha"] = created["object"]["sha"]
+    if result["after_sha"] != target_sha:
+        raise RuntimeError("创建响应的 SHA 与上游不一致，请检查新分支。")
+    if reference_sha(api, repo, branch) != target_sha:
+        raise RuntimeError("新分支在创建后再次发生变化，请检查分支。")
+    result.update(status="created", message="已从上游原始 SHA 创建分支；新分支没有同步前的旧版本，无需备份 tag。")
+
+
+def sync_branch(api, repo, upstream, branch, dry_run, run_label, result,
+                create_missing=False):
     # 固定双方 SHA，避免检查和更新之间上游继续推送导致比较对象变化。
-    old_sha = reference_sha(api, repo, branch)
+    try:
+        old_sha = reference_sha(api, repo, branch)
+    except GitHubAPIError as exc:
+        if not create_missing or exc.status != 404:
+            raise
+        create_branch(api, repo, upstream, branch, dry_run, result)
+        return
     target_sha = reference_sha(api, upstream, branch)
     result.update(old_sha=old_sha, upstream_sha=target_sha)
     if old_sha == target_sha:
@@ -165,6 +215,7 @@ def scan_and_sync(api, config, dry_run, run_label, results):
     include = {value.lower() for value in config.get("include_repositories", [])}
     exclude = {value.lower() for value in config.get("exclude_repositories", [])}
     overrides = {key.lower(): value for key, value in config.get("branch_overrides", {}).items()}
+    all_branches = config.get("sync_all_branches", False)
     found = set()
     for entry in owned_repositories(api):
         if entry["owner"]["login"].lower() != login or not entry["fork"]:
@@ -187,7 +238,16 @@ def scan_and_sync(api, config, dry_run, run_label, results):
             if not parent:
                 raise RuntimeError("无法获取上游父仓库信息。")
             upstream = parent["full_name"]
-            branches = overrides.get(repo.lower(), [parent["default_branch"]])
+            if repo.lower() in overrides:
+                branches = overrides[repo.lower()]
+            elif all_branches:
+                branches = [item["name"] for item in repository_branches(api, upstream)]
+            else:
+                branches = [parent["default_branch"]]
+            if not branches:
+                result.update(status="no_branches", message="上游仓库没有可同步分支。")
+                results.append(result)
+                continue
         except Exception as exc:
             result["message"] = str(exc)
             results.append(result)
@@ -197,7 +257,8 @@ def scan_and_sync(api, config, dry_run, run_label, results):
                       "branch": branch, "status": "error"}
             results.append(result)
             try:
-                sync_branch(api, repo, upstream, branch, dry_run, run_label, result)
+                sync_branch(api, repo, upstream, branch, dry_run, run_label, result,
+                            create_missing=all_branches)
             except Exception as exc:
                 result.update(status="error", message=str(exc))
     for missing in sorted(include - found):
@@ -215,7 +276,8 @@ def write_reports(results, dry_run, fatal_error=None):
     def cell(value):
         return html.escape(str(value)).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
-    lines = ["# Fork 同步报告", "", f"模式：{'只检查' if dry_run else '正式同步'}。时间：{report['generated_at']}。", ""]
+    lines = ["# Fork 同步报告", "", f"模式：{'只检查' if dry_run else '正式同步'}。时间：{report['generated_at']}。", "",
+             "数量按报告行统计；同一仓库的多个分支分别记录，整仓库跳过时记录一行。", ""]
     if fatal_error:
         lines.extend(["全局错误：" + cell(fatal_error), ""])
     if counts:
