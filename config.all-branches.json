@@ -1,0 +1,6 @@
+{
+  "sync_all_branches": true,
+  "include_repositories": [],
+  "exclude_repositories": ["Lanyifan/claude-code"],
+  "branch_overrides": {}
+}
